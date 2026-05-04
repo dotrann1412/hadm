@@ -2,7 +2,7 @@
 
 Simplified PyTorch re-implementation of **"Detecting Human Artifacts from Text-to-Image Models"** ([arXiv:2411.13842](https://arxiv.org/abs/2411.13842)). [Here](https://github.com/wangkaihong/hadm) is the original implementation but it is quite messy, and complex in the dependency graph. 
 
-> This is just a quick version created with support by `Opus 4.6`, it may contains many hidden issues. Still too lazy to set up the environemnt to run the original source code. 
+> This is just a quick version created with support by `Opus 4.6`, it may contain many hidden issues. Still too lazy to set up the environemnt to run the original source code and re-validate. 
 
 ## What it does
 
