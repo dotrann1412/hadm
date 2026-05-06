@@ -196,6 +196,8 @@ class ProposalGenerator(nn.Module):
         scores = torch.cat(scores, dim=1)
 
         result = []
+        min_k = float('inf')
+
         for b in range(proposals.shape[0]):
             p = clip_boxes_to_image(proposals[b], image_size)
             s = scores[b].sigmoid()
@@ -206,8 +208,11 @@ class ProposalGenerator(nn.Module):
 
             keep = batched_nms(p, s, torch.zeros_like(s, dtype=torch.int64), self.nms_thresh)
             keep = keep[: self.post_nms_topk]
+
+            min_k = min(min_k, keep.shape[0])
             result.append(p[keep])
 
+        result = [r[:,:min_k,:] for r in result]
         return torch.stack(result)  # (B, K, 4)
 
 
