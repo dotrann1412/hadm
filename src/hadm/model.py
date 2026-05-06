@@ -5,13 +5,14 @@ Full HADM detector: EVA-02 backbone + RPN + Cascade R-CNN.
 import math
 from collections import OrderedDict
 from typing import Optional
-
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import batched_nms, clip_boxes_to_image, roi_align
 
 from .backbone import Backbone
+
 
 LOCAL_CLASSES = ["face", "torso", "arm", "leg", "hand", "feet"]
 GLOBAL_CLASSES = [
@@ -46,6 +47,29 @@ def _decode_boxes(deltas, anchors, weights=(1., 1., 1., 1.)):
     h = torch.exp(dh) * ah
     return torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=1)
 
+
+class ModelEMA(nn.Module):
+    """Exponential Moving Average for model parameters.
+
+    Mirrors the EMA used in the original HADM training (decay=0.9999).
+    The EMA model is used for evaluation/inference.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        super().__init__()
+        self.decay = decay
+        self.module = copy.deepcopy(model)
+        self.module.eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for ema_p, src_p in zip(self.module.parameters(), model.parameters()):
+            ema_p.data.mul_(self.decay).add_(src_p.data, alpha=1.0 - self.decay)
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
 
 # ---------------------------------------------------------------------------
 # Anchor Generator
@@ -528,3 +552,171 @@ def load_hadm_weights(model: HADM, checkpoint_path: str,
 
 def get_class_names(mode: str) -> list[str]:
     return list(LOCAL_CLASSES if mode == "local" else GLOBAL_CLASSES)
+
+from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+def _patch_roi_heads_for_multilabel(roi_heads, num_classes: int):
+    """Patch RoIHeads to use sigmoid BCE loss and sigmoid inference for multi-label.
+
+    The original HADM-G uses sigmoid CE with multi-label: a single person bounding
+    box can carry multiple anomaly tags (e.g. "missing arm" + "extra hand").
+    Standard Faster R-CNN uses softmax CE (single-label per proposal).
+
+    We override two internal behaviors:
+      1. Training loss:  softmax CE  →  one-hot + sigmoid BCE
+      2. Inference scores: softmax   →  sigmoid
+    """
+    import torchvision.models.detection.roi_heads as _rh
+
+    _orig_forward = roi_heads.forward.__func__
+
+    def _multilabel_forward(self, features, proposals, image_shapes, targets=None):
+        if not self.training:
+            return _orig_forward(self, features, proposals, image_shapes, targets)
+
+        # --- training path with sigmoid BCE ---
+        self.check_targets(targets)
+        if targets is not None:
+            for t in targets:
+                floating_point_types = (torch.float, torch.double, torch.half)
+                if not t["boxes"].dtype in floating_point_types:
+                    raise TypeError(f"target boxes must be of float type, got {t['boxes'].dtype}")
+
+        proposals, matched_idxs, labels, regression_targets = self.select_training_samples(
+            proposals, targets
+        )
+
+        box_features = self.box_roi_pool(features, proposals, image_shapes)
+        box_features = self.box_head(box_features)
+        class_logits, box_regression = self.box_predictor(box_features)
+
+        labels_cat = torch.cat(labels, dim=0)
+        regression_targets_cat = torch.cat(regression_targets, dim=0)
+
+        one_hot = torch.zeros(
+            labels_cat.size(0), num_classes, device=labels_cat.device, dtype=class_logits.dtype
+        )
+        fg_mask = labels_cat > 0
+        one_hot[fg_mask] = one_hot[fg_mask].scatter(1, labels_cat[fg_mask].unsqueeze(1), 1.0)
+
+        classification_loss = F.binary_cross_entropy_with_logits(class_logits, one_hot)
+
+        sampled_pos_inds = torch.where(labels_cat > 0)[0]
+        labels_pos = labels_cat[sampled_pos_inds]
+        N, num_cls = box_regression.shape[0], box_regression.shape[1] // 4
+        box_regression = box_regression.reshape(N, num_cls, 4)
+
+        box_loss = F.smooth_l1_loss(
+            box_regression[sampled_pos_inds, labels_pos],
+            regression_targets_cat[sampled_pos_inds],
+            beta=1.0 / 9,
+            reduction="sum",
+        ) / max(labels_cat.numel(), 1)
+
+        losses = {"loss_classifier": classification_loss, "loss_box_reg": box_loss}
+
+        # still need objectness / rpn losses — those are computed by the caller
+        # (GeneralizedRCNN.forward adds them), so we only return roi losses here.
+        return [], losses
+
+    import types
+    roi_heads.forward = types.MethodType(_multilabel_forward, roi_heads)
+
+    _orig_postprocess = roi_heads.postprocess_detections.__func__
+
+    def _sigmoid_postprocess(self, class_logits, box_regression, proposals, image_shapes):
+        device = class_logits.device
+        num_classes_total = class_logits.shape[-1]
+
+        boxes_per_image = [boxes_in_image.shape[0] for boxes_in_image in proposals]
+        pred_boxes = self.box_coder.decode(box_regression, proposals)
+        pred_scores = torch.sigmoid(class_logits)
+
+        pred_boxes_list = pred_boxes.split(boxes_per_image, 0)
+        pred_scores_list = pred_scores.split(boxes_per_image, 0)
+
+        from torchvision.ops import boxes as box_ops
+
+        all_boxes, all_scores, all_labels = [], [], []
+        for boxes, scores, image_shape in zip(pred_boxes_list, pred_scores_list, image_shapes):
+            boxes = box_ops.clip_boxes_to_image(boxes, image_shape)
+
+            # boxes shape: (N, num_classes, 4) or (N, 1, 4)
+            # scores shape: (N, num_classes)
+            labels = torch.arange(num_classes_total, device=device)
+            labels = labels.view(1, -1).expand_as(scores)
+
+            # drop background class (index 0)
+            boxes = boxes[:, 1:]
+            scores = scores[:, 1:]
+            labels = labels[:, 1:]
+
+            # flatten all class predictions into one list
+            boxes = boxes.reshape(-1, 4)
+            scores = scores.reshape(-1)
+            labels = labels.reshape(-1)
+
+            keep = scores > self.score_thresh
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
+            keep = box_ops.remove_small_boxes(boxes, min_size=1e-2)
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
+            keep = box_ops.batched_nms(boxes, scores, labels, self.nms_thresh)
+            keep = keep[: self.detections_per_img]
+            boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+
+            all_boxes.append(boxes)
+            all_scores.append(scores)
+            all_labels.append(labels)
+
+        return all_boxes, all_scores, all_labels
+
+    roi_heads.postprocess_detections = types.MethodType(_sigmoid_postprocess, roi_heads)
+
+
+def build_model(
+    mode: str = "local",
+    pretrained_backbone: bool = True,
+    min_size: int = 1024,
+    max_size: int = 1024,
+    box_score_thresh: float = 0.05,
+    box_nms_thresh: float = 0.5,
+    box_detections_per_img: int = 100,
+):
+    """Build a Faster R-CNN for HADM artifact detection.
+
+    Args:
+        mode: 'local' (6 body-part classes) or 'global' (12 anomaly classes).
+        pretrained_backbone: Initialize from COCO-pretrained Faster R-CNN weights.
+        min_size: Input image minimum dimension (the model resizes internally).
+        max_size: Input image maximum dimension.
+        box_score_thresh: Minimum score for kept detections at inference.
+        box_nms_thresh: NMS IoU threshold.
+        box_detections_per_img: Max detections per image.
+
+    Returns:
+        nn.Module — a Faster R-CNN model ready for fine-tuning.
+    """
+    classes = LOCAL_CLASSES if mode == "local" else GLOBAL_CLASSES
+    num_classes = len(classes) + 1  # +1 for background class
+
+    weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT if pretrained_backbone else None
+    model = fasterrcnn_resnet50_fpn_v2(
+        weights=weights,
+        min_size=min_size,
+        max_size=max_size,
+        box_score_thresh=box_score_thresh,
+        box_nms_thresh=box_nms_thresh,
+        box_detections_per_img=box_detections_per_img,
+    )
+
+    box_predictor = model.roi_heads.box_predictor
+    in_features: int = box_predictor.cls_score.in_features  # type: ignore[union-attr]
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+
+    if mode == "global":
+        _patch_roi_heads_for_multilabel(model.roi_heads, num_classes)
+
+    return model
