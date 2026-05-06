@@ -212,7 +212,7 @@ class ProposalGenerator(nn.Module):
             min_k = min(min_k, keep.shape[0])
             result.append(p[keep])
 
-        result = [r[:,:min_k,:] for r in result]
+        result = [r[:min_k,:] for r in result]
         return torch.stack(result)  # (B, K, 4)
 
 
